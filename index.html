@@ -590,109 +590,170 @@ if('serviceWorker' in navigator){
 
 <script>
 
-let customerScannerOpen=false, customerStream=null, customerTimer=null;
-let customerDetector=null, customerLastCode='', customerLastTime=0;
-let customerScanning=false;
 
-function scanCustomerItem(){
+let customerScannerOpen=false;
+let customerStream=null;
+let customerTimer=null;
+let customerDetector=null;
+let customerLastCode='';
+let customerLastTime=0;
+let customerScanning=false;
+let customerZXingReader=null;
+
+function stopAllCameraStreams(){
+  try{
+    if(typeof barcodeTimer!=='undefined' && barcodeTimer){
+      clearTimeout(barcodeTimer); barcodeTimer=null;
+    }
+  }catch(e){}
+  try{
+    if(typeof zxingReader!=='undefined' && zxingReader){
+      zxingReader.reset(); zxingReader=null;
+    }
+  }catch(e){}
+  try{
+    if(typeof barcodeStream!=='undefined' && barcodeStream){
+      barcodeStream.getTracks().forEach(t=>t.stop());
+      barcodeStream=null;
+    }
+  }catch(e){}
+  try{
+    if(customerTimer){clearTimeout(customerTimer);customerTimer=null;}
+  }catch(e){}
+  try{
+    if(customerZXingReader){customerZXingReader.reset();customerZXingReader=null;}
+  }catch(e){}
+  try{
+    if(customerStream){
+      customerStream.getTracks().forEach(t=>t.stop());
+      customerStream=null;
+    }
+  }catch(e){}
+}
+
+async function scanCustomerItem(){
   const modal=document.getElementById('barcodeScannerModal');
   const video=document.getElementById('barcodeVideo');
   const status=document.getElementById('barcodeScanStatus');
-  if(!modal||!video||!status){ alert('Scanner is unavailable.'); return; }
+  if(!modal||!video||!status){
+    alert('Scanner is unavailable.');
+    return;
+  }
+
+  stopAllCameraStreams();
 
   customerScannerOpen=true;
   customerScanning=true;
+  customerLastCode='';
+  customerLastTime=0;
+
   modal.classList.remove('hidden');
-  status.textContent='Ready — point the camera at a barcode';
-
-  startTrueContinuousScanner(video,status);
-}
-
-async function startTrueContinuousScanner(video,status){
-  stopCustomerScannerLoop(false);
+  video.style.display='block';
+  video.style.visibility='visible';
+  video.autoplay=true;
+  video.muted=true;
+  video.setAttribute('playsinline','true');
+  video.setAttribute('webkit-playsinline','true');
+  status.textContent='Opening camera…';
 
   if(!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia){
-    status.textContent='Camera is not supported on this device/browser.';
+    status.textContent='Camera unavailable. Make sure you are using HTTPS and allow camera access.';
     return;
   }
 
   try{
     customerStream=await navigator.mediaDevices.getUserMedia({
+      audio:false,
       video:{
-        facingMode:{ideal:'environment'},
+        facingMode:'environment',
         width:{ideal:1280},
         height:{ideal:720}
-      },
-      audio:false
+      }
     });
 
+    if(!customerScannerOpen) return;
+
     video.srcObject=customerStream;
-    video.setAttribute('playsinline','true');
-    video.setAttribute('autoplay','true');
-    video.muted=true;
+
+    await new Promise(resolve=>{
+      if(video.readyState>=1) resolve();
+      else video.addEventListener('loadedmetadata',resolve,{once:true});
+    });
+
     await video.play();
 
-    if('BarcodeDetector' in window){
-      try{
+    status.textContent='📷 Ready — scan the next item';
+
+    startCustomerDecodeLoop(video,status);
+  }catch(err){
+    console.error('Customer camera error',err);
+    status.textContent='❌ Camera error: '+(err && err.message ? err.message : 'Permission denied');
+    if(customerStream){
+      customerStream.getTracks().forEach(t=>t.stop());
+      customerStream=null;
+    }
+  }
+}
+
+async function startCustomerDecodeLoop(video,status){
+  if(!customerScanning || !customerScannerOpen) return;
+
+  if('BarcodeDetector' in window){
+    try{
+      if(!customerDetector){
         customerDetector=new BarcodeDetector({
-          formats:['ean_13','ean_8','upc_a','upc_e','code_128','code_39','itf','codabar']
+          formats:[
+            'ean_13','ean_8','upc_a','upc_e',
+            'code_128','code_39','code_93','codabar','itf','qr_code'
+          ]
         });
-      }catch(e){
-        customerDetector=new BarcodeDetector();
       }
-      runBarcodeDetectorLoop(video,status);
-    }else{
-      loadZXingContinuous(video,status);
+
+      const scan=async()=>{
+        if(!customerScanning || !customerScannerOpen) return;
+        try{
+          const codes=await customerDetector.detect(video);
+          if(codes && codes.length){
+            const value=String(codes[0].rawValue||'').trim();
+            if(value) handleContinuousCustomerCode(value,status);
+          }
+        }catch(e){}
+        if(customerScanning && customerScannerOpen){
+          customerTimer=setTimeout(scan,250);
+        }
+      };
+      scan();
+      return;
+    }catch(e){
+      customerDetector=null;
     }
-  }catch(e){
-    status.textContent='Camera error: '+(e.message||e);
   }
+
+  startCustomerZXing(video,status);
 }
 
-async function runBarcodeDetectorLoop(video,status){
-  if(!customerScanning || !customerScannerOpen)return;
-
-  try{
-    const results=await customerDetector.detect(video);
-    if(results && results.length){
-      const code=String(results[0].rawValue||'').trim();
-      if(code){
-        handleContinuousCustomerCode(code,status);
-      }
-    }
-  }catch(e){}
-
-  // IMPORTANT: schedule the NEXT scan after every detection.
-  // The loop never closes the camera after a successful scan.
-  if(customerScanning && customerScannerOpen){
-    customerTimer=setTimeout(()=>runBarcodeDetectorLoop(video,status),180);
-  }
-}
-
-function loadZXingContinuous(video,status){
-  if(window.ZXingBrowser){
-    startZXingContinuous(video,status);
+function startCustomerZXing(video,status){
+  if(!window.ZXingBrowser){
+    const s=document.createElement('script');
+    s.src='https://unpkg.com/@zxing/browser@0.1.5/umd/index.min.js';
+    s.onload=()=>startCustomerZXing(video,status);
+    s.onerror=()=>status.textContent='❌ Scanner library failed to load. Check internet connection.';
+    document.head.appendChild(s);
     return;
   }
-  const s=document.createElement('script');
-  s.src='https://unpkg.com/@zxing/browser@0.1.5/umd/index.min.js';
-  s.onload=()=>startZXingContinuous(video,status);
-  s.onerror=()=>status.textContent='Scanner library could not load.';
-  document.head.appendChild(s);
-}
 
-async function startZXingContinuous(video,status){
   try{
     const reader=new ZXingBrowser.BrowserMultiFormatReader();
     customerZXingReader=reader;
     reader.decodeFromVideoElement(video,(result)=>{
-      if(!customerScanning || !customerScannerOpen)return;
-      if(result && result.getText()){
-        handleContinuousCustomerCode(result.getText(),status);
+      if(!customerScanning || !customerScannerOpen) return;
+      if(result){
+        const value=result.getText ? result.getText() : result.text;
+        if(value) handleContinuousCustomerCode(value,status);
       }
     });
   }catch(e){
-    status.textContent='Unable to start scanner: '+(e.message||e);
+    status.textContent='❌ Unable to start barcode decoder.';
   }
 }
 
@@ -700,9 +761,9 @@ function handleContinuousCustomerCode(code,status){
   code=String(code||'').trim();
   const now=Date.now();
 
-  // Prevent the same barcode from being added repeatedly while it is still
-  // sitting in front of the camera. After 1.2 seconds it can be scanned again.
-  if(code===customerLastCode && now-customerLastTime<1200)return;
+  if(!code) return;
+  if(code===customerLastCode && now-customerLastTime<1300) return;
+
   customerLastCode=code;
   customerLastTime=now;
 
@@ -713,72 +774,64 @@ function addScannedCustomerItemContinuous(code,status){
   const p=products.find(x=>String(x.barcode||'').trim()===code);
 
   if(!p){
-    if(typeof playScanBeep==='function')playScanBeep(false);
+    if(typeof playScanBeep==='function') playScanBeep(false);
     status.textContent='❌ Barcode not found: '+code;
     return;
   }
 
-  if(Number(p.stock)<=0){
-    if(typeof playScanBeep==='function')playScanBeep(false);
-    status.textContent='❌ '+p.name+' is out of stock.';
+  const stock=Number(p.stock||0);
+  const existing=cart.find(x=>x.name===p.name);
+  const newQty=(existing?Number(existing.qty):0)+1;
+
+  if(newQty>stock){
+    if(typeof playScanBeep==='function') playScanBeep(false);
+    status.textContent='❌ No more stock: '+p.name;
     return;
   }
 
-  if(typeof playScanBeep==='function')playScanBeep(true);
+  if(typeof playScanBeep==='function') playScanBeep(true);
 
-  const existing=cart.find(x=>x.name===p.name);
   if(existing){
-    if(existing.qty>=Number(p.stock)){
-      status.textContent='❌ No more stock for '+p.name+'.';
-      return;
-    }
-    existing.qty++;
+    existing.qty=newQty;
   }else{
-    cart.push({
-      name:p.name,
-      price:Number(p.price),
-      qty:1
-    });
+    cart.push({name:p.name,price:Number(p.price||0),qty:1});
   }
 
-  if(typeof renderCart==='function')renderCart();
+  if(typeof renderCart==='function') renderCart();
 
-  status.textContent='✓ Added: '+p.name+' — Ready for next scan';
-  if(navigator.vibrate)navigator.vibrate(80);
+  status.textContent='✓ '+p.name+' added — Ready for next scan';
+  if(navigator.vibrate) navigator.vibrate(60);
 }
 
-function stopCustomerScannerLoop(stopCamera=true){
+function closeCustomerScanner(){
+  customerScannerOpen=false;
   customerScanning=false;
+
   if(customerTimer){
     clearTimeout(customerTimer);
     customerTimer=null;
   }
 
-  if(customerZXingReader){
-    try{customerZXingReader.reset();}catch(e){}
-    customerZXingReader=null;
-  }
+  try{
+    if(customerZXingReader){
+      customerZXingReader.reset();
+      customerZXingReader=null;
+    }
+  }catch(e){}
 
-  if(stopCamera && customerStream){
+  if(customerStream){
     customerStream.getTracks().forEach(t=>t.stop());
     customerStream=null;
   }
 
-  if(stopCamera){
-    const video=document.getElementById('barcodeVideo');
-    if(video){
-      try{video.pause();}catch(e){}
-      video.srcObject=null;
-    }
+  const video=document.getElementById('barcodeVideo');
+  if(video){
+    try{video.pause();}catch(e){}
+    video.srcObject=null;
   }
-}
-
-function closeCustomerScanner(){
-  customerScannerOpen=false;
-  stopCustomerScannerLoop(true);
 
   const modal=document.getElementById('barcodeScannerModal');
-  if(modal)modal.classList.add('hidden');
+  if(modal) modal.classList.add('hidden');
 }
 
 function customerScannerDone(){
@@ -792,9 +845,9 @@ function customerScannerDone(){
   <div class="modalbox" style="max-width:520px">
     <h2>📷 Scan Barcode</h2>
     <p style="color:#777;margin-top:-5px">Itutok ang camera sa barcode. Kapag nabasa, awtomatikong ilalagay ang number.</p>
-    <video id="barcodeVideo" playsinline autoplay muted style="width:100%;border-radius:14px;background:#111;max-height:55vh;object-fit:cover"></video>
+    <video id="barcodeVideo" playsinline autoplay muted style="display:block;width:100%;height:280px;border-radius:14px;background:#111;object-fit:cover;transform:none"></video>
     <div id="barcodeScanStatus" style="padding:10px 0;text-align:center;color:#713707;font-weight:bold">Starting camera…</div>
-    <button class="secondary" type="button" onclick="customerScannerDone();closeBarcodeScanner()" style="width:100%">CLOSE</button>
+    <button class="secondary" type="button" onclick="customerScannerDone()" style="width:100%">CLOSE</button>
   </div>
 </div>
 
